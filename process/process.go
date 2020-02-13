@@ -2,6 +2,12 @@ package process
 
 import (
 	"fmt"
+	"github.com/ochinchina/filechangemonitor"
+	"github.com/ochinchina/supervisord/config"
+	"github.com/ochinchina/supervisord/events"
+	"github.com/ochinchina/supervisord/logger"
+	"github.com/ochinchina/supervisord/signals"
+	"github.com/robfig/cron/v3"
 	log "github.com/sirupsen/logrus"
 	"io"
 	"os"
@@ -10,10 +16,6 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"supervisord/config"
-	"supervisord/events"
-	"supervisord/logger"
-	"supervisord/signals"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -32,6 +34,13 @@ const (
 	FATAL                 = 200
 	UNKNOWN               = 1000
 )
+
+var scheduler *cron.Cron = nil
+
+func init() {
+	scheduler = cron.New(cron.WithSeconds())
+	scheduler.Start()
+}
 
 func (p ProcessState) String() string {
 	switch p {
@@ -84,7 +93,24 @@ func NewProcess(supervisor_id string, config *config.ConfigEntry) *Process {
 		retryTimes: new(int32)}
 	proc.config = config
 	proc.cmd = nil
+	proc.addToCron()
 	return proc
+}
+
+// add this process to crontab
+func (p *Process) addToCron() {
+	s := p.config.GetString("cron", "")
+
+	if s != "" {
+		log.WithFields(log.Fields{"program": p.GetName()}).Info("try to create cron program with cron expression:", s)
+		scheduler.AddFunc(s, func() {
+			log.WithFields(log.Fields{"program": p.GetName()}).Info("start cron program")
+			if !p.isRunning() {
+				p.Start(false)
+			}
+		})
+	}
+
 }
 
 // start the process
@@ -123,6 +149,10 @@ func (p *Process) Start(wait bool) {
 					runCond.Signal()
 				}
 			})
+			//avoid print too many logs if fail to start program too quickly
+			if time.Now().Unix()-p.startTime.Unix() < 2 {
+				time.Sleep(5 * time.Second)
+			}
 			if p.stopByUser {
 				log.WithFields(log.Fields{"program": p.GetName()}).Info("Stopped by user, don't start it again")
 				break
@@ -331,11 +361,12 @@ func (p *Process) getExitCodes() []int {
 // check if the process is running or not
 //
 func (p *Process) isRunning() bool {
-	if p.cmd != nil && p.cmd.ProcessState != nil {
+	if p.cmd != nil && p.cmd.Process != nil {
 		if runtime.GOOS == "windows" {
 			proc, err := os.FindProcess(p.cmd.Process.Pid)
 			return proc != nil && err == nil
 		} else {
+			fmt.Printf("send signal 0 to process\n")
 			return p.cmd.Process.Signal(syscall.Signal(0)) == nil
 		}
 	}
@@ -358,6 +389,7 @@ func (p *Process) createProgramCommand() error {
 		log.WithFields(log.Fields{"user": p.config.GetString("user", "")}).Error("fail to run as user")
 		return fmt.Errorf("fail to set user")
 	}
+	p.setProgramRestartChangeMonitor(args[0])
 	set_deathsig(p.cmd.SysProcAttr)
 	p.setEnv()
 	p.setDir()
@@ -365,6 +397,29 @@ func (p *Process) createProgramCommand() error {
 
 	p.stdin, _ = p.cmd.StdinPipe()
 	return nil
+
+}
+
+func (p *Process) setProgramRestartChangeMonitor(programPath string) {
+	if p.config.GetBool("restart_when_binary_changed", false) {
+		AddProgramChangeMonitor(programPath, func(path string, mode filechangemonitor.FileChangeMode) {
+			log.WithFields(log.Fields{"program": p.GetName()}).Info("program is changed, resatrt it")
+			p.Stop(true)
+			p.Start(true)
+		})
+	}
+	dir_monitor := p.config.GetString("restart_directory_monitor", "")
+	file_pattern := p.config.GetString("restart_file_pattern", "*")
+	if dir_monitor != "" {
+		AddConfigChangeMonitor(dir_monitor, file_pattern, func(path string, mode filechangemonitor.FileChangeMode) {
+			//fmt.Printf( "file_pattern=%s, base=%s\n", file_pattern, filepath.Base( path ) )
+			//if matched, err := filepath.Match( file_pattern, filepath.Base( path ) ); matched && err == nil {
+			log.WithFields(log.Fields{"program": p.GetName()}).Info("configure file for program is changed, resatrt it")
+			p.Stop(true)
+			p.Start(true)
+			//}
+		})
+	}
 
 }
 
@@ -381,6 +436,8 @@ func (p *Process) waitForExit(startSecs int64) {
 	p.lock.Lock()
 	defer p.lock.Unlock()
 	p.stopTime = time.Now()
+	p.StdoutLog.Close()
+	p.StderrLog.Close()
 }
 
 // fail to start the program
@@ -731,7 +788,12 @@ func (p *Process) setUser() error {
 func (p *Process) Stop(wait bool) {
 	p.lock.Lock()
 	p.stopByUser = true
+	isRunning := p.isRunning()
 	p.lock.Unlock()
+	if !isRunning {
+		log.WithFields(log.Fields{"program": p.GetName()}).Info("program is not running")
+		return
+	}
 	log.WithFields(log.Fields{"program": p.GetName()}).Info("stop the program")
 	sigs := strings.Fields(p.config.GetString("stopsignal", ""))
 	waitsecs := time.Duration(p.config.GetInt("stopwaitsecs", 10)) * time.Second

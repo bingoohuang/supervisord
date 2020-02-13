@@ -2,11 +2,13 @@ package main
 
 import (
 	"fmt"
+	"github.com/jessevdk/go-flags"
+	"github.com/ochinchina/supervisord/config"
+	"github.com/ochinchina/supervisord/types"
+	"github.com/ochinchina/supervisord/xmlrpcclient"
+	"net/http"
 	"os"
 	"strings"
-	"supervisord/config"
-	"supervisord/types"
-	"supervisord/xmlrpcclient"
 )
 
 type CtlCommand struct {
@@ -25,6 +27,9 @@ type StartCommand struct {
 type StopCommand struct {
 }
 
+type RestartCommand struct {
+}
+
 type ShutdownCommand struct {
 }
 
@@ -37,14 +42,31 @@ type PidCommand struct {
 type SignalCommand struct {
 }
 
+type LogtailCommand struct {
+}
+
+// A wrapper can be use to check whether
+// number of parameters is valid or not
+type CmdCheckWrapperCommand struct {
+	// Original cmd
+	cmd flags.Commander
+	// leastNumArgs indicates how many arguments
+	// this cmd should have at least
+	leastNumArgs int
+	// Print usage when arguments not valid
+	usage string
+}
+
 var ctlCommand CtlCommand
-var statusCommand StatusCommand
-var startCommand StartCommand
-var stopCommand StopCommand
-var shutdownCommand ShutdownCommand
-var reloadCommand ReloadCommand
-var pidCommand PidCommand
-var signalCommand SignalCommand
+var statusCommand = CmdCheckWrapperCommand{&StatusCommand{}, 0, ""}
+var startCommand = CmdCheckWrapperCommand{&StartCommand{}, 0, ""}
+var stopCommand = CmdCheckWrapperCommand{&StopCommand{}, 0, ""}
+var restartCommand = CmdCheckWrapperCommand{&RestartCommand{}, 0, ""}
+var shutdownCommand = CmdCheckWrapperCommand{&ShutdownCommand{}, 0, ""}
+var reloadCommand = CmdCheckWrapperCommand{&ReloadCommand{}, 0, ""}
+var pidCommand = CmdCheckWrapperCommand{&PidCommand{}, 1, "pid <program>"}
+var signalCommand = CmdCheckWrapperCommand{&SignalCommand{}, 2, "signal <signal_name> <program>[...]"}
+var logtailCommand = CmdCheckWrapperCommand{&LogtailCommand{}, 1, "logtail <program>"}
 
 func (x *CtlCommand) getServerUrl() string {
 	options.Configuration, _ = findSupervisordConf()
@@ -119,15 +141,15 @@ func (x *CtlCommand) Execute(args []string) error {
 	case "status":
 		x.status(rpcc, args[1:])
 
-	////////////////////////////////////////////////////////////////////////////////
-	// START or STOP
-	////////////////////////////////////////////////////////////////////////////////
+		////////////////////////////////////////////////////////////////////////////////
+		// START or STOP
+		////////////////////////////////////////////////////////////////////////////////
 	case "start", "stop":
 		x.startStopProcesses(rpcc, verb, args[1:])
 
-	////////////////////////////////////////////////////////////////////////////////
-	// SHUTDOWN
-	////////////////////////////////////////////////////////////////////////////////
+		////////////////////////////////////////////////////////////////////////////////
+		// SHUTDOWN
+		////////////////////////////////////////////////////////////////////////////////
 	case "shutdown":
 		x.shutdown(rpcc)
 	case "reload":
@@ -164,6 +186,10 @@ func (x *CtlCommand) startStopProcesses(rpcc *xmlrpcclient.XmlRPCClient, verb st
 		"start": "started",
 		"stop":  "stopped",
 	}
+	x._startStopProcesses(rpcc, verb, processes, state[verb], true)
+}
+
+func (x *CtlCommand) _startStopProcesses(rpcc *xmlrpcclient.XmlRPCClient, verb string, processes []string, state string, showProcessInfo bool) {
 	if len(processes) <= 0 {
 		fmt.Printf("Please specify process for %s\n", verb)
 	}
@@ -171,23 +197,32 @@ func (x *CtlCommand) startStopProcesses(rpcc *xmlrpcclient.XmlRPCClient, verb st
 		if pname == "all" {
 			reply, err := rpcc.ChangeAllProcessState(verb)
 			if err == nil {
-				x.showProcessInfo(&reply, make(map[string]bool))
+				if showProcessInfo {
+					x.showProcessInfo(&reply, make(map[string]bool))
+				}
 			} else {
 				fmt.Printf("Fail to change all process state to %s", state)
 			}
 		} else {
 			if reply, err := rpcc.ChangeProcessState(verb, pname); err == nil {
-				fmt.Printf("%s: ", pname)
-				if !reply.Value {
-					fmt.Printf("not ")
+				if showProcessInfo {
+					fmt.Printf("%s: ", pname)
+					if !reply.Value {
+						fmt.Printf("not ")
+					}
+					fmt.Printf("%s\n", state)
 				}
-				fmt.Printf("%s\n", state[verb])
 			} else {
 				fmt.Printf("%s: failed [%v]\n", pname, err)
 				os.Exit(1)
 			}
 		}
 	}
+}
+
+func (x *CtlCommand) restartProcesses(rpcc *xmlrpcclient.XmlRPCClient, processes []string) {
+	x._startStopProcesses(rpcc, "stop", processes, "stopped", false)
+	x._startStopProcesses(rpcc, "start", processes, "restarted", true)
 }
 
 // shutdown the supervisord
@@ -255,6 +290,21 @@ func (x *CtlCommand) getPid(rpcc *xmlrpcclient.XmlRPCClient, process string) {
 	}
 }
 
+func (x *CtlCommand) getProcessInfo(rpcc *xmlrpcclient.XmlRPCClient, process string) (types.ProcessInfo, error) {
+	return rpcc.GetProcessInfo(process)
+}
+
+// check if group name should be displayed
+func (x *CtlCommand) showGroupName() bool {
+	val, ok := os.LookupEnv("SUPERVISOR_GROUP_DISPLAY")
+	if !ok {
+		return false
+	}
+
+	val = strings.ToLower(val)
+	return val == "yes" || val == "true" || val == "y" || val == "t" || val == "1"
+}
+
 func (x *CtlCommand) showProcessInfo(reply *xmlrpcclient.AllProcessInfoReply, processesMap map[string]bool) {
 	for _, pinfo := range reply.Value {
 		description := pinfo.Description
@@ -262,7 +312,11 @@ func (x *CtlCommand) showProcessInfo(reply *xmlrpcclient.AllProcessInfoReply, pr
 			description = ""
 		}
 		if x.inProcessMap(&pinfo, processesMap) {
-			fmt.Printf("%s%-33s%-10s%s%s\n", x.getANSIColor(pinfo.Statename), pinfo.GetFullName(), pinfo.Statename, description, "\x1b[0m")
+			processName := pinfo.GetFullName()
+			if !x.showGroupName() {
+				processName = pinfo.Name
+			}
+			fmt.Printf("%s%-33s%-10s%s%s\n", x.getANSIColor(pinfo.Statename), processName, pinfo.Statename, description, "\x1b[0m")
 		}
 	}
 }
@@ -317,6 +371,11 @@ func (sc *StopCommand) Execute(args []string) error {
 	return nil
 }
 
+func (rc *RestartCommand) Execute(args []string) error {
+	ctlCommand.restartProcesses(ctlCommand.createRpcClient(), args)
+	return nil
+}
+
 func (sc *ShutdownCommand) Execute(args []string) error {
 	ctlCommand.shutdown(ctlCommand.createRpcClient())
 	return nil
@@ -338,6 +397,55 @@ func (pc *PidCommand) Execute(args []string) error {
 	return nil
 }
 
+func (lc *LogtailCommand) Execute(args []string) error {
+	program := args[0]
+	go func() {
+		lc.tailLog(program, "stderr")
+	}()
+	return lc.tailLog(program, "stdout")
+}
+
+func (lc *LogtailCommand) tailLog(program string, dev string) error {
+	_, err := ctlCommand.getProcessInfo(ctlCommand.createRpcClient(), program)
+	if err != nil {
+		fmt.Printf("Not exist program %s\n", program)
+		return err
+	}
+	url := fmt.Sprintf("%s/logtail/%s/%s", ctlCommand.getServerUrl(), program, dev)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return err
+	}
+	req.SetBasicAuth(ctlCommand.getUser(), ctlCommand.getPassword())
+	client := http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	buf := make([]byte, 10240)
+	for {
+		n, err := resp.Body.Read(buf)
+		if err != nil {
+			return err
+		}
+		if dev == "stdout" {
+			os.Stdout.Write(buf[0:n])
+		} else {
+			os.Stderr.Write(buf[0:n])
+		}
+	}
+	return nil
+}
+
+func (wc *CmdCheckWrapperCommand) Execute(args []string) error {
+	if len(args) < wc.leastNumArgs {
+		err := fmt.Errorf("Invalid arguments.\nUsage: supervisord ctl %v", wc.usage)
+		fmt.Printf("%v\n", err)
+		return err
+	}
+	return wc.cmd.Execute(args)
+}
+
 func init() {
 	ctlCmd, _ := parser.AddCommand("ctl",
 		"Control a running daemon",
@@ -355,6 +463,10 @@ func init() {
 		"stop programs",
 		"stop one or more programs",
 		&stopCommand)
+	ctlCmd.AddCommand("restart",
+		"restart programs",
+		"restart one or more programs",
+		&restartCommand)
 	ctlCmd.AddCommand("shutdown",
 		"shutdown supervisord",
 		"shutdown supervisord",
@@ -371,5 +483,9 @@ func init() {
 		"get the pid of specified program",
 		"get the pid of specified program",
 		&pidCommand)
+	ctlCmd.AddCommand("logtail",
+		"get the standard output&standard error of the program",
+		"get the standard output&standard error of the program",
+		&logtailCommand)
 
 }
